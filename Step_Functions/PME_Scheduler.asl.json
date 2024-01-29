@@ -1,0 +1,88 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Get Events Ready to Run on Cadence",
+  "States": {
+    "Get Events Ready to Run on Cadence": {
+      "Type": "Task",
+      "Parameters": {
+        "TableName": "PME_Config",
+        "ConsistentRead": true,
+        "KeyConditionExpression": "PME_Schema = :val",
+        "FilterExpression": "Cadence = :num",
+        "ExpressionAttributeValues": {
+          ":val": {
+            "S.$": "$.dataset"
+          },
+          ":num": {
+            "N.$": "$.cadence"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:query",
+      "Next": "Get Domain-Datasource Mapping",
+      "ResultPath": "$.input"
+    },
+    "Get Domain-Datasource Mapping": {
+      "Type": "Task",
+      "Next": "Map",
+      "Parameters": {
+        "TableName": "PME_Config",
+        "ConsistentRead": true,
+        "KeyConditionExpression": "PME_Schema = :val and PME_ResourceName = :val1",
+        "ProjectionExpression": "customerDomains",
+        "ExpressionAttributeValues": {
+          ":val": {
+            "S": "Config"
+          },
+          ":val1": {
+            "S.$": "$.config"
+          }
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:query",
+      "ResultPath": "$.customerDomains"
+    },
+    "Map": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Wait",
+        "States": {
+          "Wait": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "Step Functions StartExecution"
+          },
+          "Step Functions StartExecution": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution",
+            "Parameters": {
+              "StateMachineArn": "arn:aws:states:us-west-2:710578378071:stateMachine:Get_SQL_Data",
+              "Input": {
+                "StatePayload": {
+                  "body.$": "$"
+                },
+                "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "ItemSelector": {
+        "Dataset.$": "$$.Map.Item.Value.PME_ResourceName.S",
+        "targetDomain.$": "$.targetDomain",
+        "customerDomains.$": "$.customerDomains"
+      },
+      "ResultPath": "$.map",
+      "ItemsPath": "$.input.Items",
+      "MaxConcurrency": 4,
+      "Next": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

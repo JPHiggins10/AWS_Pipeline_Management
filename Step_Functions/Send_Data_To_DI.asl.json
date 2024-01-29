@@ -1,0 +1,307 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Pass",
+  "States": {
+    "Pass": {
+      "Type": "Pass",
+      "Next": "Send Data to DI",
+      "InputPath": "$.StatePayload"
+    },
+    "Send Data to DI": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "arn:aws:lambda:us-west-2:710578378071:function:DI_etl_json_to_soda:$LATEST"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "InputPath": "$.body",
+      "ResultPath": "$.ErrorState.Payload",
+      "Next": "Copy Object To Processed",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "Comment": "Missed Error",
+          "Next": "Release Lock - fail"
+        }
+      ]
+    },
+    "Copy Object To Processed": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket.$": "$.body.Bucket",
+        "Key.$": "States.Format('Processed/{}_{}',$.Payload.Payload.processedDate,$.object[1])",
+        "CopySource.$": "States.Format('{}/{}*{}',$.watchedBucket,$.object[0],$.object[1])"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "ResultPath": null,
+      "InputPath": "$.body",
+      "Next": "Delete Input File"
+    },
+    "Delete Input File": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket.$": "$.watchedBucket",
+        "Key.$": "States.Format('{}*{}',$.object[0],$.object[1])"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "Next": "Delete Running Job",
+      "ResultPath": null,
+      "InputPath": "$.body"
+    },
+    "Delete Running Job": {
+      "Type": "Task",
+      "Next": "Delete Generated Json",
+      "Parameters": {
+        "Bucket.$": "$.body.Bucket",
+        "Key.$": "States.Format('runningJobs/{}_{}',$.body.body.socratadomain,$.body.body.fxf)"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "InputPath": "$.body",
+      "ResultPath": null
+    },
+    "Delete Generated Json": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket.$": "$.body.Bucket",
+        "Key.$": "$.Payload.Payload.S3_File"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "Next": "Ingestion Status",
+      "InputPath": "$.body",
+      "ResultPath": null
+    },
+    "Ingestion Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ErrorState.Payload.Payload.ErrorState",
+          "StringMatches": "Success",
+          "Next": "Release Lock - success"
+        }
+      ],
+      "Default": "Release Lock - fail"
+    },
+    "Release Lock - success": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "Key": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#currentlockcount": "currentlockcount",
+          "#lockownerid.$": "$.Payload.Payload.lockOwnerId"
+        },
+        "ExpressionAttributeValues": {
+          ":decrease": {
+            "N": "1"
+          }
+        },
+        "UpdateExpression": "SET #currentlockcount = #currentlockcount - :decrease REMOVE #lockownerid",
+        "ConditionExpression": "attribute_exists(#lockownerid)",
+        "ReturnValues": "UPDATED_NEW"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Next": "Dynamo PutItem Success",
+          "ResultPath": null
+        }
+      ],
+      "Next": "Dynamo PutItem Success",
+      "ResultPath": null,
+      "InputPath": "$.body"
+    },
+    "Release Lock - fail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "Key": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#currentlockcount": "currentlockcount",
+          "#lockownerid.$": "$.Payload.Payload.lockOwnerId"
+        },
+        "ExpressionAttributeValues": {
+          ":decrease": {
+            "N": "1"
+          }
+        },
+        "UpdateExpression": "SET #currentlockcount = #currentlockcount - :decrease REMOVE #lockownerid",
+        "ConditionExpression": "attribute_exists(#lockownerid)",
+        "ReturnValues": "UPDATED_NEW"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Next": "Dynamo PutItem Fail"
+        }
+      ],
+      "Next": "Dynamo PutItem Fail",
+      "InputPath": "$.body",
+      "ResultPath": null
+    },
+    "Dynamo PutItem Fail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "PME_Status",
+        "Item": {
+          "clientDomain": {
+            "S.$": "$.body.object[0]"
+          },
+          "DT": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          "attributes": {
+            "M": {
+              "socrataDomain": {
+                "S.$": "$.body.object[0]"
+              },
+              "socrataDataset": {
+                "S.$": "$.body.input.pme_id[0]"
+              },
+              "endTime": {
+                "S.$": "$$.State.EnteredTime"
+              },
+              "payloadBytes": {
+                "N": "0"
+              },
+              "numRows": {
+                "N": "0"
+              },
+              "socrataDuration": {
+                "N": "0"
+              },
+              "startTime": {
+                "S.$": "States.Format('{}',$.body.startTime)"
+              },
+              "success": {
+                "BOOL": false
+              }
+            }
+          }
+        }
+      },
+      "Next": "SNS Publish",
+      "ResultPath": null
+    },
+    "Dynamo PutItem Success": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "PME_Status",
+        "Item": {
+          "clientDomain": {
+            "S.$": "$.body.object[0]"
+          },
+          "DT": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          "attributes": {
+            "M": {
+              "socrataDomain": {
+                "S.$": "$.body.object[0]"
+              },
+              "socrataDataset": {
+                "S.$": "$.body.input.pme_id[0]"
+              },
+              "endTime": {
+                "S.$": "$$.State.EnteredTime"
+              },
+              "payloadBytes": {
+                "N.$": "States.Format('{}',$.ErrorState.Payload.Payload.Data[0].payload_size_bytes)"
+              },
+              "numRows": {
+                "N.$": "States.Format('{}',$.ErrorState.Payload.Payload.Data[0].num_rows)"
+              },
+              "socrataDuration": {
+                "N.$": "States.Format('{}',$.ErrorState.Payload.Payload.Data[0].insertion_time_secs)"
+              },
+              "startTime": {
+                "S.$": "States.Format('{}',$.body.startTime)"
+              },
+              "success": {
+                "BOOL": true
+              }
+            }
+          }
+        }
+      },
+      "Next": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "SNS Publish": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-west-2:710578378071:ETLFailure",
+        "Message": {
+          "Value.$": "States.Format('Socrata PME Failure {} for {} on Domain {}',$.body.pme_config.Item.transactiontype.S,$.body.pme_config.Item.PME_ResourceName.S,$.body.object[0])"
+        }
+      },
+      "Next": "Fail"
+    },
+    "Fail": {
+      "Type": "Fail"
+    }
+  }
+}

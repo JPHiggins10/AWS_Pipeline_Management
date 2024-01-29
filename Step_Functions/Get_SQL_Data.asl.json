@@ -1,0 +1,139 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Parse Input",
+  "States": {
+    "Parse Input": {
+      "Type": "Pass",
+      "Next": "GetSecretValue",
+      "InputPath": "$.StatePayload.body"
+    },
+    "GetSecretValue": {
+      "Type": "Task",
+      "Parameters": {
+        "SecretId": "EERP_Testing"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:secretsmanager:getSecretValue",
+      "ResultPath": "$.SecretString",
+      "Next": "DynamoDB GetItem"
+    },
+    "DynamoDB GetItem": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "PME_Config",
+        "Key": {
+          "PME_Schema": {
+            "S": "Dataset"
+          },
+          "PME_ResourceName": {
+            "S.$": "$.Dataset"
+          }
+        }
+      },
+      "Next": "HeadObject",
+      "ResultPath": "$.config"
+    },
+    "HeadObject": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket.$": "$.config.Item.awsBucket.S",
+        "Key.$": "States.Format('sql_definition/{}.sql',$.config.Item.PME_ResourceName.S)"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "Next": "Choice",
+          "ResultPath": "$.s3Result"
+        }
+      ],
+      "Next": "Get SQL Data",
+      "ResultPath": "$.s3Result"
+    },
+    "Get SQL Data": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "arn:aws:lambda:us-west-2:710578378071:function:GetSQLData:$LATEST"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "SQL Success",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "Next": "SNS Fail",
+          "ResultPath": "$"
+        }
+      ]
+    },
+    "SQL Success": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.status",
+          "StringMatches": "Success",
+          "Next": "Success"
+        }
+      ],
+      "Default": "SNS Fail"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "Choice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.s3Result.Error",
+          "StringMatches": "S3.NoSuchKeyException",
+          "Next": "Get Schema"
+        }
+      ],
+      "Default": "SNS Fail"
+    },
+    "SNS Fail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-west-2:710578378071:ETLFailure",
+        "Message": {
+          "Value": "Socrata PME Failure"
+        }
+      },
+      "Next": "Fail",
+      "ResultPath": "$.error"
+    },
+    "Get Schema": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "arn:aws:lambda:us-west-2:710578378071:function:GetMissingDDL:$LATEST"
+      },
+      "Next": "Get SQL Data",
+      "ResultPath": "$.schemaResult"
+    },
+    "Fail": {
+      "Type": "Fail",
+      "Error": "Fail"
+    }
+  }
+}

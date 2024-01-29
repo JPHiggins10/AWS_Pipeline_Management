@@ -1,0 +1,397 @@
+{
+  "Comment": "A description of my state machine ",
+  "StartAt": "Massage incoming message",
+  "States": {
+    "Massage incoming message": {
+      "Type": "Pass",
+      "Next": "Get Concurrency Info",
+      "Parameters": {
+        "object.$": "States.StringSplit($.detail.object.key,'*')",
+        "objectSize.$": "$.detail.object.size",
+        "startTime.$": "$$.Execution.StartTime",
+        "watchedBucket.$": "$.detail.bucket.name"
+      }
+    },
+    "Get Concurrency Info": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "PME_Config",
+        "Key": {
+          "PME_Schema": {
+            "S": "Config"
+          },
+          "PME_ResourceName": {
+            "S": "domainConfig"
+          }
+        }
+      },
+      "Next": "Get PME ID",
+      "ResultPath": "$.domainConfig"
+    },
+    "Get PME ID": {
+      "Type": "Pass",
+      "Next": "Acquire Lock",
+      "Parameters": {
+        "startTime.$": "$.startTime",
+        "pme_id.$": "States.StringSplit($.object[1],'.')"
+      },
+      "ResultPath": "$.input"
+    },
+    "Acquire Lock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "Key": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#currentlockcount": "currentlockcount",
+          "#lockownerid.$": "$$.Execution.Id"
+        },
+        "ExpressionAttributeValues": {
+          ":increase": {
+            "N": "1"
+          },
+          ":limit": {
+            "N.$": "$.domainConfig.Item.Dataset_Upsert_Concurrency_Limit.N"
+          },
+          ":lockacquiredtime": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        },
+        "UpdateExpression": "SET #currentlockcount = #currentlockcount + :increase, #lockownerid = :lockacquiredtime",
+        "ConditionExpression": "currentlockcount <> :limit and attribute_not_exists(#lockownerid)",
+        "ReturnValues": "UPDATED_NEW"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "BackoffRate": 2,
+          "IntervalSeconds": 1,
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "BackoffRate": 2,
+          "IntervalSeconds": 1,
+          "MaxAttempts": 6
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "Next": "Initialize Lock Item",
+          "ResultPath": "$.lockinfo.acquisitionerror"
+        },
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Next": "Get Current Lock Record",
+          "ResultPath": "$.lockinfo.acquisitionerror"
+        }
+      ],
+      "Next": "DynamoDB GetItem",
+      "ResultPath": "$.lockinfo"
+    },
+    "Initialize Lock Item": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "Item": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          },
+          "currentlockcount": {
+            "N": "0"
+          }
+        },
+        "ConditionExpression": "LockName <> :lockname",
+        "ExpressionAttributeValues": {
+          ":lockname": {
+            "S": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        }
+      },
+      "Next": "Acquire Lock",
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Acquire Lock",
+          "ResultPath": null
+        }
+      ]
+    },
+    "Get Current Lock Record": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "ExpressionAttributeNames": {
+          "#lockownerid.$": "$$.Execution.Id"
+        },
+        "Key": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        },
+        "ProjectionExpression": "#lockownerid"
+      },
+      "Next": "Check If Lock Already Acquired"
+    },
+    "Wait to Get Lock": {
+      "Type": "Wait",
+      "Seconds": 3,
+      "Next": "Acquire Lock"
+    },
+    "Check If Lock Already Acquired": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.lockinfo.currentlockitem.ItemString",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.lockinfo.currentlockitem.ItemString",
+              "StringMatches": "*Z*"
+            }
+          ],
+          "Next": "Continue Because Lock Was Already Acquired"
+        }
+      ],
+      "Default": "Wait to Get Lock"
+    },
+    "Continue Because Lock Was Already Acquired": {
+      "Type": "Pass",
+      "Next": "DynamoDB GetItem"
+    },
+    "DynamoDB GetItem": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "PME_Config",
+        "Key": {
+          "PME_Schema": {
+            "S": "Dataset"
+          },
+          "PME_ResourceName": {
+            "S.$": "$.input.pme_id[0]"
+          }
+        }
+      },
+      "Next": "Copy file for processing",
+      "ResultPath": "$.pme_config"
+    },
+    "Copy file for processing": {
+      "Type": "Task",
+      "Next": "GetSecretValue",
+      "Parameters": {
+        "Bucket.$": "$.pme_config.Item.awsBucket.S",
+        "CopySource.$": "States.Format('{}/{}*{}',$.watchedBucket,$.object[0],$.object[1])",
+        "Key.$": "States.Format('json_files/{}_{}',$$.State.EnteredTime,$.object[1])"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "ResultSelector": {
+        "timeTag.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.timeTag"
+    },
+    "GetSecretValue": {
+      "Type": "Task",
+      "Next": "Set Up Socrata Info",
+      "Parameters": {
+        "SecretId": "EERP_Testing"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:secretsmanager:getSecretValue",
+      "ResultPath": "$.SecretString",
+      "ResultSelector": {
+        "SecretString.$": "States.StringToJson($.SecretString)"
+      }
+    },
+    "Set Up Socrata Info": {
+      "Type": "Pass",
+      "Next": "Set Payload",
+      "Parameters": {
+        "Bucket.$": "$.pme_config.Item.awsBucket.S",
+        "Key": "json_files/",
+        "File.$": "States.Format('{}_{}',$.timeTag.timeTag,$.object[1])",
+        "body": {
+          "fxf.$": "$.pme_config.Item.PME_ResourceName.S",
+          "updateType.$": "$.pme_config.Item.transactiontype.S",
+          "socratadomain.$": "$.object[0]"
+        }
+      },
+      "ResultPath": "$.body"
+    },
+    "Set Payload": {
+      "Type": "Pass",
+      "Next": "Checking file size",
+      "Parameters": {
+        "Payload": {
+          "S3_File.$": "States.Format('{}{}',$.body.Key,$.body.File)",
+          "JSONFile.$": "$.body.File",
+          "jsonFileSize.$": "$.objectSize",
+          "processedDate.$": "$$.State.EnteredTime",
+          "lockOwnerId.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.Payload"
+    },
+    "Checking file size": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Payload.Payload.jsonFileSize",
+          "NumericGreaterThan": 100000000,
+          "Next": "Release Lock",
+          "Comment": "File size exeeds maximum"
+        }
+      ],
+      "Default": "Send Data to DI"
+    },
+    "Release Lock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.domainConfig.Item.Concurrency_Table.S",
+        "Key": {
+          "LockName": {
+            "S.$": "States.Format('{}*{}',$.object[0],$.input.pme_id[0])"
+          }
+        },
+        "ExpressionAttributeNames": {
+          "#currentlockcount": "currentlockcount",
+          "#lockownerid.$": "$$.Execution.Id"
+        },
+        "ExpressionAttributeValues": {
+          ":decrease": {
+            "N": "1"
+          }
+        },
+        "UpdateExpression": "SET #currentlockcount = #currentlockcount - :decrease REMOVE #lockownerid",
+        "ConditionExpression": "attribute_exists(#lockownerid)",
+        "ReturnValues": "UPDATED_NEW"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "BackoffRate": 2,
+          "IntervalSeconds": 1,
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "BackoffRate": 1.5,
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Next": "Status PutItem Fail"
+        }
+      ],
+      "Next": "Status PutItem Fail",
+      "ResultPath": "$.lockInfo"
+    },
+    "Send Data to DI": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-west-2:710578378071:stateMachine:Send_Data_To_DI",
+        "Input": {
+          "StatePayload": {
+            "body.$": "$"
+          },
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "InputPath": "$",
+      "ResultPath": "$.ErrorState",
+      "End": true
+    },
+    "Status PutItem Fail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "PME_Status",
+        "Item": {
+          "clientDomain": {
+            "S.$": "$.object[0]"
+          },
+          "DT": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          "attributes": {
+            "M": {
+              "socrataDomain": {
+                "S.$": "$.object[0]"
+              },
+              "socrataDataset": {
+                "S.$": "$.input.pme_id[0]"
+              },
+              "endTime": {
+                "S.$": "$$.State.EnteredTime"
+              },
+              "payloadBytes": {
+                "N": "0"
+              },
+              "socrataDuration": {
+                "N": "0"
+              },
+              "numRows": {
+                "N": "0"
+              },
+              "startTime": {
+                "S.$": "States.Format('{}',$.startTime)"
+              },
+              "success": {
+                "BOOL": false
+              }
+            }
+          }
+        }
+      },
+      "Next": "SNS Publish",
+      "ResultPath": null
+    },
+    "SNS Publish": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-west-2:710578378071:ETLFailure",
+        "Message": {
+          "Value": "States.Format('Socrata Failure {} for {} on Domain {}',$.updateType,$.fxf,$socratadomain)"
+        }
+      },
+      "Next": "Fail",
+      "InputPath": "$.body.body"
+    },
+    "Fail": {
+      "Type": "Fail"
+    }
+  }
+}
